@@ -1,0 +1,47 @@
+#!/bin/bash
+# cursor-ping — turn ALL Cursor agent sounds on/off:
+#   - the "agent finished" ping + pop-up (from ~/.cursor/hooks/ping.sh)
+#   - Cursor's in-progress accessibility sounds (the blips between thinking steps)
+#   cursor-ping            toggle
+#   cursor-ping on|off     set explicitly
+#   cursor-ping status     show current state
+#   cursor-ping test       play the ping now
+#   cursor-ping sound X    pick a sound from /System/Library/Sounds (Glass, Hero, Ping, Pop, Purr, Submarine, Tink...)
+FLAG="$HOME/.cursor/ping-off"
+SOUNDFILE="$HOME/.cursor/ping-sound"
+SETTINGS="$HOME/Library/Application Support/Cursor/User/settings.json"
+sound() { cat "$SOUNDFILE" 2>/dev/null || echo Glass; }
+
+# Set Cursor's accessibility-sound volume (0 = silent, 70 = Cursor default). Cursor reloads this live.
+set_signal_volume() {
+  local vol="$1"
+  mkdir -p "$(dirname "$SETTINGS")"
+  [ -s "$SETTINGS" ] || echo '{}' > "$SETTINGS"
+  VOL="$vol" /usr/bin/perl -0pi -e '
+    my $v = $ENV{VOL};
+    if (/"accessibility\.signalOptions\.volume"\s*:\s*\d+/) {
+      s/("accessibility\.signalOptions\.volume"\s*:\s*)\d+/${1}$v/;
+    } else {
+      s/\{/{\n    "accessibility.signalOptions.volume": $v,/;
+    }' "$SETTINGS"
+}
+
+case "${1:-toggle}" in
+  on)     rm -f "$FLAG" ;;
+  off)    touch "$FLAG" ;;
+  toggle) if [ -e "$FLAG" ]; then rm -f "$FLAG"; else touch "$FLAG"; fi ;;
+  status) ;;
+  test)   /usr/bin/afplay "/System/Library/Sounds/$(sound).aiff"; exit 0 ;;
+  sound)
+    if [ -z "$2" ]; then ls /System/Library/Sounds | sed 's/\.aiff$//'; echo "current: $(sound)"; exit 0; fi
+    [ -f "/System/Library/Sounds/$2.aiff" ] || { echo "No sound named '$2'"; exit 1; }
+    echo "$2" > "$SOUNDFILE"; /usr/bin/afplay "/System/Library/Sounds/$2.aiff"; echo "Sound set to $2"; exit 0 ;;
+  *) sed -n '2,10p' "$0"; exit 1 ;;
+esac
+if [ -e "$FLAG" ]; then STATE=OFF; else STATE=ON; fi
+if [ "$1" != status ]; then
+  if [ "$STATE" = OFF ]; then set_signal_volume 0; else set_signal_volume 70; fi
+  /usr/bin/osascript -e "display notification \"Ping is $STATE\" with title \"Cursor\"" >/dev/null 2>&1
+fi
+echo "Cursor ping: $STATE"
+exit 0

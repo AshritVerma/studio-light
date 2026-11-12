@@ -1,0 +1,135 @@
+#!/bin/bash
+# cursor-ping-schedule: keeps Cursor's agent sounds matched to the studio-light hours.
+# They're off while the front light is off and on while it's on.
+#
+#   cursor-ping-schedule install     start it, matching Cursor to the light right away
+#   cursor-ping-schedule sync        match Cursor to the light right now
+#   cursor-ping-schedule status      show the hours and the current state
+#   cursor-ping-schedule uninstall   stop it
+#
+# A LaunchAgent runs it every minute and at login and wake. When it starts, and each
+# time the light switches, it sets Cursor to match. A manual `cursor-ping on` or `off`
+# (or Toggle Cursor Ping) holds until the next switch. The hours come from studio-light's
+# config, so `sudo studio-light hours ...` moves both.
+
+CONF="${CURSOR_PING_CONF:-/Library/Application Support/studio-light/config}"
+PING="${CURSOR_PING_BIN:-$HOME/bin/cursor-ping}"
+STATE="${CURSOR_PING_STATE:-$HOME/.cursor/ping-schedule-state}"
+OLD_STATE="$HOME/.cursor/ping-schedule-period"   # from the first version, which didn't sync at start
+LABEL="local.cursor-ping-schedule"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="$HOME/Library/Logs/cursor-ping-schedule.log"
+SELF="$HOME/bin/cursor-ping-schedule"
+
+stamp() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# "HH:MM" -> minutes after midnight; fails on anything else.
+to_min() {
+  case "$1" in
+    [0-9]:[0-5][0-9] | [01][0-9]:[0-5][0-9] | 2[0-3]:[0-5][0-9]) echo $(( 10#${1%%:*} * 60 + 10#${1##*:} )) ;;
+    *) return 1 ;;
+  esac
+}
+
+# Same rule as studio-light: off from $2 up to $3, wrapping past midnight; equal = always off.
+in_off_hours() {
+  if [ "$2" -eq "$3" ]; then return 0; fi
+  if [ "$2" -lt "$3" ]; then [ "$1" -ge "$2" ] && [ "$1" -lt "$3" ]; else [ "$1" -ge "$2" ] || [ "$1" -lt "$3" ]; fi
+}
+
+conf_get() { awk -v k="$1" '$1 == k { print $2; exit }' "$CONF" 2>/dev/null; }
+
+# Sets OFF, ON and PERIOD (on/off) from the config and the clock; fails if the config is unusable.
+read_hours() {
+  local offm onm now
+  OFF=$(conf_get off); ON=$(conf_get on)
+  offm=$(to_min "$OFF") && onm=$(to_min "$ON") || return 1
+  now=$(to_min "${CURSOR_PING_NOW:-$(date +%H:%M)}") || return 1   # CURSOR_PING_NOW is for testing
+  if in_off_hours "$now" "$offm" "$onm"; then PERIOD=off; else PERIOD=on; fi
+}
+
+run() {
+  local last
+  [ -r "$CONF" ] || return 0   # studio-light isn't installed: nothing to follow
+  if ! read_hours; then echo "$(stamp) couldn't read the hours in $CONF"; return 1; fi
+  last=$(cat "$STATE" 2>/dev/null)
+  [ "$last" = "$PERIOD" ] && return 0
+  # The light switched, or there's no record yet (first run, or `sync`): make Cursor match it.
+  if "$PING" "$PERIOD" >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$STATE")" && echo "$PERIOD" > "$STATE"
+    rm -f "$OLD_STATE"
+    echo "$(stamp) Cursor sounds $PERIOD, matching the light"
+  else
+    echo "$(stamp) cursor-ping $PERIOD failed; will retry in a minute"
+    return 1
+  fi
+}
+
+sync_now() {
+  rm -f "$STATE"
+  run
+}
+
+status() {
+  if [ ! -r "$CONF" ]; then echo "studio-light isn't installed, so there are no hours to follow."; return 0; fi
+  if ! read_hours; then echo "Couldn't read the hours in $CONF"; return 1; fi
+  if [ "$OFF" = "$ON" ]; then echo "Hours:     light always off, so Cursor sounds stay off"
+  else echo "Hours:     Cursor sounds off $OFF -> on $ON (same as the light)"; fi
+  echo "Right now: light $PERIOD; Cursor last set to: $(cat "$STATE" 2>/dev/null || echo nothing yet)"
+  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then echo "Job:       loaded, checks every minute"
+  else echo "Job:       not loaded (run: cursor-ping-schedule install)"; fi
+  echo "Cursor:    $("$PING" status 2>/dev/null | tail -n 1)"
+  if [ -s "$LOG" ]; then echo "Last log:  $(tail -n 1 "$LOG")"; fi
+}
+
+install_agent() {
+  [ -x "$PING" ] || { echo "can't find $PING"; return 1; }
+  [ -r "$CONF" ] || echo "Note: studio-light isn't installed yet; this will start following it once it is."
+  mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$SELF</string>
+    <string>run</string>
+  </array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  sync_now | tee -a "$LOG"   # match now, before the job starts, so it has nothing left to do
+  local ok=0
+  for _ in 1 2 3; do
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then ok=1; break; fi
+    sleep 1
+  done
+  [ "$ok" -eq 1 ] || { echo "launchctl couldn't load $PLIST"; return 1; }
+  sleep 1
+  echo "Done. Cursor's sounds now stay matched to the light."
+  status
+}
+
+uninstall_agent() {
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  rm -f "$PLIST" "$STATE" "$OLD_STATE"
+  echo "Removed. Cursor's sounds stay as they are now; use Toggle Cursor Ping to change them."
+}
+
+case "${1:-status}" in
+  run) run ;;
+  sync) sync_now ;;
+  status) status ;;
+  install) install_agent ;;
+  uninstall) uninstall_agent ;;
+  *) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 64 ;;
+esac
